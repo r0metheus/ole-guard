@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 
-from oletools.olevba import VBA_Parser, TYPE_OLE, TYPE_OpenXML, TYPE_Word2003_XML, TYPE_MHTML
+from oletools.olevba import VBA_Parser, TYPE_OLE, TYPE_OpenXML, TYPE_Word2003_XML, TYPE_MHTML, SUSPICIOUS_KEYWORDS, detect_patterns
 import hashlib
 import subprocess
 import sys
@@ -82,16 +82,26 @@ def main():
 		results = vbaparser.analysis_results
 
 		sus = []
+		iocs = []
+		isProbablyDownloader = False
 		for kw_type, keyword, description in results:
-			if 'to obf' in description:
+			if 'obfuscate' in description or 'VBA Stomping' in keyword:
 				sus.append(keyword)
-
+			if 'IOC' in kw_type:
+				iocs.append(keyword)
+			if 'IP' in description:
+				isProbablyDownloader = True
+		
+		structure[filename]['category'] = 'Downloader' if isProbablyDownloader else 'Dropper'
 		structure[filename]['obfuscation_methods'] = list(set(sus))
-		structure[filename]['macros_num'] = vbaparser.nb_macros()
+		structure[filename]['iocs'] = list(set(iocs))
+		structure[filename]['macros_num'] = vbaparser.nb_macros
 
 		with open(directory+'_results', 'a') as f:
 			json.dump(structure[filename], f)
 			f.write(os.linesep)
+		
+		vbaparser.close()
 
 	f.close()
 

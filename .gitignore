@@ -2,6 +2,8 @@
 __pycache__/
 *.py[cod]
 *$py.class
+folder/
+folder_results
 
 # C extensions
 *.so
