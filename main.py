@@ -68,7 +68,6 @@ def main():
 		sus = []
 		iocs = []
 		isProbablyDownloader = False
-		headers = {'Accept': 'application/json'}
 		isOnline = False
 
 		for kw_type, keyword, description in results:
