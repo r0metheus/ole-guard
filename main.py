@@ -7,8 +7,9 @@ import sys
 import os
 import magic
 import json
+import urllib.request, json 
 
-encoding = 'latin-1'
+encoding = 'utf-8'
 
 def md5(filename):
     hash_md5 = hashlib.md5()
@@ -37,28 +38,11 @@ def sha512(filename):
         for chunk in iter(lambda: f.read(4096), b""):
             hash_sha512.update(chunk)
     return hash_sha512.hexdigest()
-
-def generic(file, scraped):
-	m = (subprocess.run(["xxd", "-l", "8",  file], capture_output=True).stdout).decode(encoding).split(':')[1].split()[:-1]
-	magic = ""
-	for c in m:
-		magic += c+' '
 	
-	scraped.magic = magic
-	
-def strings(file, exp, scraped):
+def strings(file, exp):
 	strings = (subprocess.run(["strings", file], capture_output=True).stdout).decode(encoding).split()
-
-	"""
-	for i in range(len(strings)):
-		if exp in strings[i]:
-			tmp = strings[i]
-	"""
-
-	scraped.strings.extend([sub for sub in strings if exp in sub])
-
-def oledump(file, scraped):
-	scraped.oledump = (subprocess.run(["oledump.py", "-d", "--decompress", file], capture_output=True).stdout).decode(encoding)
+	
+	return [sub for sub in strings if exp in sub]
 
 def main():
 	directory = sys.argv[1]
@@ -84,11 +68,16 @@ def main():
 		sus = []
 		iocs = []
 		isProbablyDownloader = False
+		headers = {'Accept': 'application/json'}
+		isOnline = False
+
 		for kw_type, keyword, description in results:
 			if 'obfuscate' in description or 'VBA Stomping' in keyword:
 				sus.append(keyword)
 			if 'IOC' in kw_type:
 				iocs.append(keyword)
+				if 'http' in keyword:
+					isProbablyDownloader = True					
 			if 'IP' in description:
 				isProbablyDownloader = True
 		
@@ -96,10 +85,12 @@ def main():
 		structure[filename]['obfuscation_methods'] = list(set(sus))
 		structure[filename]['iocs'] = list(set(iocs))
 		structure[filename]['macros_num'] = vbaparser.nb_macros
+		structure[filename]['strings'] = strings(file, 'C:\\')
 
-		with open(directory+'_results', 'a') as f:
+		with open(directory+'_results.txt', 'a') as f:
 			json.dump(structure[filename], f)
 			f.write(os.linesep)
+			f.write('\n')
 		
 		vbaparser.close()
 

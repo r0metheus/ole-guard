@@ -2,8 +2,7 @@
 __pycache__/
 *.py[cod]
 *$py.class
-folder/
-folder_results
+samples*
 
 # C extensions
 *.so
