@@ -7,7 +7,9 @@ import sys
 import os
 import magic
 import json
-import urllib.request, json 
+import requests, json
+import whois
+import csv
 
 encoding = 'utf-8'
 
@@ -38,17 +40,67 @@ def sha512(filename):
         for chunk in iter(lambda: f.read(4096), b""):
             hash_sha512.update(chunk)
     return hash_sha512.hexdigest()
+
+def check_host(endpoint, type):
+	headers = {'Accept': 'application/json', 'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/96.0.4664.93 Safari/537.36'}
+	if type == 'url':
+		url = 'https://check-host.net/check-http?host='+endpoint+'&max_nodes=3'
+		res = requests.get(url, headers=headers).json()
+		url = 'https://check-host.net/check-result/'+res['request_id']
+		res = requests.get(url, headers=headers).json()
+		
+		for record in res.keys():
+			if res[record] is None:
+				continue
+			if 'OK' in res[record][0] or '200' in res[record][0]:
+				return True
+		return False
+
+	if type == 'IP':
+		res = subprocess.run(['ping', endpoint, '-c', '2'], stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
+		if res.returncode == 0:
+			return True
+		return False	
 	
-def strings(file, exp):
-	strings = (subprocess.run(["strings", file], capture_output=True).stdout).decode(encoding).split()
+def check_domain(domain):
+	endpoint = domain.strip('http://').split('/')[0]
+
+	w = whois.whois(endpoint)
+
+	domain_name = w['domain_name']
+	registrar = w['registrar']
+	name_servers = w['name_servers']
+
+	return {'domain_name': domain_name, 'registrar': registrar, 'name_servers': name_servers}
 	
-	return [sub for sub in strings if exp in sub]
+def parameters(file, timeout):
+	proc = subprocess.Popen(['vmonkey', file, '-o', 'tmp'], stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
+	vmonkey_output = {}
+
+	try:
+		proc.wait(timeout=timeout)
+	except subprocess.TimeoutExpired:
+		proc.kill()
+	
+	if proc.returncode == 0:
+		with open('tmp', 'r') as f:
+			vmonkey_output = json.load(f)
+	
+			f.close()
+	
+		res = subprocess.run(['rm', 'tmp'])
+	
+	return vmonkey_output
 
 def main():
+	enableWhois = True
 	directory = sys.argv[1]
 	structure = {}
 
 	for filename in os.listdir(directory):
+		if 'artifacts' in filename:
+			continue
+
 		file = directory + os.path.sep + filename
 		vbaparser = VBA_Parser(file)
 		
@@ -58,6 +110,9 @@ def main():
 		structure[filename]['sha256'] = sha256(file)
 		structure[filename]['sha512'] = sha512(file)
 		structure[filename]['mime'] = magic.from_file(file, mime=True)
+		structure[filename]['ext_endpoints'] = {}
+		structure[filename]['ext_endpoints']['domains'] = {}
+		structure[filename]['ext_endpoints']['IP'] = {}
 		
 		with open(file, 'rb') as f:
 			structure[filename]['magic'] = f.read(8).hex()
@@ -76,16 +131,25 @@ def main():
 			if 'IOC' in kw_type:
 				iocs.append(keyword)
 				if 'http' in keyword:
-					isProbablyDownloader = True					
+					isProbablyDownloader = True
+					structure[filename]['ext_endpoints']['domains'][keyword] = {}
+					structure[filename]['ext_endpoints']['domains'][keyword]['whois'] = {}
+					structure[filename]['ext_endpoints']['domains'][keyword]['isOnline'] = check_host(keyword, 'url')
+					structure[filename]['ext_endpoints']['domains'][keyword]['whois'] = str(check_domain(keyword))
+
 			if 'IP' in description:
 				isProbablyDownloader = True
-		
+				structure[filename]['ext_endpoints']['IP'][keyword] = {}
+				structure[filename]['ext_endpoints']['IP'][keyword]['whois'] = {}
+				structure[filename]['ext_endpoints']['IP'][keyword]['isHTTP200'] = check_host(keyword, 'IP')
+				structure[filename]['ext_endpoints']['IP'][keyword]['whois'] = str(check_domain(keyword))
+
 		structure[filename]['category'] = 'Downloader' if isProbablyDownloader else 'Dropper'
 		structure[filename]['obfuscation_methods'] = list(set(sus))
 		structure[filename]['iocs'] = list(set(iocs))
 		structure[filename]['macros_num'] = vbaparser.nb_macros
-		structure[filename]['strings'] = strings(file, 'C:\\')
-
+		structure[filename]['vmonkey_results'] = parameters(file, 30)
+		
 		with open(directory+'_results.txt', 'a') as f:
 			json.dump(structure[filename], f)
 			f.write(os.linesep)
@@ -94,6 +158,19 @@ def main():
 		vbaparser.close()
 
 	f.close()
+
+	with open(directory+'_results.csv', 'w') as f:
+		first = list(structure.keys())[0]
+		cols = [col for col in structure[first]]
+		print(cols)
+		
+		writer = csv.DictWriter(f, fieldnames=cols)
+		writer.writeheader()
+		for filename in structure:
+			writer.writerow(structure[filename])
+		
+		f.close()
+
 
 if __name__ == '__main__':
     main()
