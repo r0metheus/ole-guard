@@ -10,6 +10,12 @@ import json
 import requests, json
 import whois
 import csv
+from nslookup import Nslookup
+from urllib.parse import urlparse
+from datetime import datetime
+import argparse
+
+from plot import Plot
 
 encoding = 'utf-8'
 
@@ -62,16 +68,29 @@ def check_host(endpoint, type):
 			return True
 		return False	
 	
-def check_domain(domain):
-	endpoint = domain.strip('http://').split('/')[0]
+def check_domain(domain, type):
+	if type == 'url':
+		endpoint = urlparse(str(domain)).netloc
+	else:
+		endpoint = domain
 
-	w = whois.whois(endpoint)
+	try:
+		w = whois.whois(endpoint)
+		domain_name = w['domain_name']
+		registrar = w['registrar']
+		name_servers = w['name_servers']
 
-	domain_name = w['domain_name']
-	registrar = w['registrar']
-	name_servers = w['name_servers']
-
+	except whois.parser.PywhoisError:
+		domain_name = None
+		registrar = None
+		name_servers = None
+			
 	return {'domain_name': domain_name, 'registrar': registrar, 'name_servers': name_servers}
+
+def dns_resolver(domain, dns_query):
+	ips_record = dns_query.dns_lookup(domain)
+
+	return ips_record.answer
 	
 def parameters(file, timeout):
 	proc = subprocess.Popen(['vmonkey', file, '-o', 'tmp'], stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
@@ -92,17 +111,53 @@ def parameters(file, timeout):
 	
 	return vmonkey_output
 
+def logger(log):
+	now = datetime.now()
+	print("[{}] {}".format(now.strftime("%H:%M:%S"), log))
+
 def main():
-	enableWhois = True
-	directory = sys.argv[1]
+	parser = argparse.ArgumentParser(description='Just another OLE document script...')
+	parser.add_argument('MLWR_DIR', metavar='MLWR_DIR', type=str, help='Where the malware(s) reside(s)')
+	parser.add_argument('-v', '--vmonkey', action='store_true', help='Enable the ViperMonkey analysis')
+	parser.add_argument('-t', '--timeout', nargs=1, type=int, default=30, help='ViperMonkey analysis timeout [default = 30s]')
+	parser.add_argument('-d', '--decode', action='store_true', help='Enable olevba decode mode')
+	parser.add_argument('-D', '--deobfuscate', action='store_true', help='Enable olevba deobfuscate mode')
+
+	args = parser.parse_args()
+	
+	directory = args.MLWR_DIR
+	failed_ovba = 0
+	failed_vmonkey = 0
+
 	structure = {}
+
+	print("""
+   ____  __    ______   _____                                
+  / __ \/ /   / ____/  / ___/______________ _____  ___  _____
+ / / / / /   / __/     \__ \/ ___/ ___/ __ `/ __ \/ _ \/ ___/
+/ /_/ / /___/ /___    ___/ / /__/ /  / /_/ / /_/ /  __/ /    
+\____/_____/_____/   /____/\___/_/   \__,_/ .___/\___/_/     
+                                         /_/                 
+	""")
+
+	logger("directory: {}".format(args.MLWR_DIR))
+	logger("olevba: show_decoded_strings: {}, deobfuscate: {}".format(args.decode, args.deobfuscate))
+	logger("vmonkey: {}, timeout: {}".format(args.vmonkey, args.timeout))
 
 	for filename in os.listdir(directory):
 		if 'artifacts' in filename:
 			continue
-
+		
 		file = directory + os.path.sep + filename
+
+		logger("Analyzing '{}'...".format(filename))
+		
 		vbaparser = VBA_Parser(file)
+
+		try:
+			vbaparser.analyze_macros(show_decoded_strings=args.decode, deobfuscate=args.deobfuscate)
+		except:
+			continue
 		
 		structure[filename] = {}
 		structure[filename]['md5'] = md5(file)
@@ -110,45 +165,56 @@ def main():
 		structure[filename]['sha256'] = sha256(file)
 		structure[filename]['sha512'] = sha512(file)
 		structure[filename]['mime'] = magic.from_file(file, mime=True)
+
+		logger("Got hashes and MIME...")
+
 		structure[filename]['ext_endpoints'] = {}
 		structure[filename]['ext_endpoints']['domains'] = {}
 		structure[filename]['ext_endpoints']['IP'] = {}
 		
 		with open(file, 'rb') as f:
 			structure[filename]['magic'] = f.read(8).hex()
-
-		vbaparser.analyze_macros(show_decoded_strings=False, deobfuscate=False)
+		
 		results = vbaparser.analysis_results
 
+		if results is None:
+			failed_ovba += 1
+		
 		sus = []
 		iocs = []
 		isProbablyDownloader = False
 		isOnline = False
 
-		for kw_type, keyword, description in results:
-			if 'obfuscate' in description or 'VBA Stomping' in keyword:
-				sus.append(keyword)
-			if 'IOC' in kw_type:
-				iocs.append(keyword)
-				if 'http' in keyword:
-					isProbablyDownloader = True
-					structure[filename]['ext_endpoints']['domains'][keyword] = {}
-					structure[filename]['ext_endpoints']['domains'][keyword]['whois'] = {}
-					structure[filename]['ext_endpoints']['domains'][keyword]['isOnline'] = check_host(keyword, 'url')
-					structure[filename]['ext_endpoints']['domains'][keyword]['whois'] = str(check_domain(keyword))
+		logger("Now getting obfuscation methods, external endpoints infos (if any)...")
 
-			if 'IP' in description:
-				isProbablyDownloader = True
-				structure[filename]['ext_endpoints']['IP'][keyword] = {}
-				structure[filename]['ext_endpoints']['IP'][keyword]['whois'] = {}
-				structure[filename]['ext_endpoints']['IP'][keyword]['isHTTP200'] = check_host(keyword, 'IP')
-				structure[filename]['ext_endpoints']['IP'][keyword]['whois'] = str(check_domain(keyword))
+		if results is not None:
+			for kw_type, keyword, description in results:
+				if 'obfuscate' in description or 'VBA Stomping' in keyword:
+					sus.append(keyword)
+				if 'IOC' in kw_type:
+					iocs.append(keyword)
+					if 'http' in keyword:
+						isProbablyDownloader = True
+						structure[filename]['ext_endpoints']['domains'][keyword] = {}
+						structure[filename]['ext_endpoints']['domains'][keyword]['whois'] = check_domain(keyword, 'url')
+						structure[filename]['ext_endpoints']['domains'][keyword]['isOnline'] = check_host(keyword, 'url')
+
+				if 'IP' in description:
+					isProbablyDownloader = True
+					structure[filename]['ext_endpoints']['IP'][keyword] = {}
+					structure[filename]['ext_endpoints']['IP'][keyword]['whois'] = check_domain(keyword, 'IP')
+					structure[filename]['ext_endpoints']['IP'][keyword]['isHTTP200'] = check_host(keyword, 'IP')
+
+		logger("Getting the hypothetical category, IOCs and number of macros...")
 
 		structure[filename]['category'] = 'Downloader' if isProbablyDownloader else 'Dropper'
 		structure[filename]['obfuscation_methods'] = list(set(sus))
 		structure[filename]['iocs'] = list(set(iocs))
 		structure[filename]['macros_num'] = vbaparser.nb_macros
-		structure[filename]['vmonkey_results'] = parameters(file, 30)
+		
+		if args.vmonkey is True:
+			structure[filename]['vmonkey_results'] = parameters(file, args.timeout)
+			print(structure[filename]['vmonkey_results'])
 		
 		with open(directory+'_results.txt', 'a') as f:
 			json.dump(structure[filename], f)
@@ -162,7 +228,6 @@ def main():
 	with open(directory+'_results.csv', 'w') as f:
 		first = list(structure.keys())[0]
 		cols = [col for col in structure[first]]
-		print(cols)
 		
 		writer = csv.DictWriter(f, fieldnames=cols)
 		writer.writeheader()
@@ -170,7 +235,47 @@ def main():
 			writer.writerow(structure[filename])
 		
 		f.close()
+	
+	# TODO: modularize this 
+	dns_query = Nslookup(dns_servers=["1.1.1.1"])
+	malware_samples = len(structure.keys())
+	domains_num = 0
+	sl_domains = 0
+	domains_ips = 0
+	valid_whois = 0
+	valid_ip_whois = 0
+	ips_num = 0
 
-
+	for key in structure.keys():
+		domains_num += len(structure[key]['ext_endpoints']['domains'].keys())
+		ips_num += len(structure[key]['ext_endpoints']['IP'].keys())
+		
+		if structure[key]['ext_endpoints']['domains'] is not None:
+			for domain in structure[key]['ext_endpoints']['domains']:
+				ext = urlparse(domain).netloc
+				if 'www.' not in ext and ext.count('.') == 2:
+					sl_domains += 1
+				
+				if structure[key]['ext_endpoints']['domains'][domain]['whois']['domain_name'] is not None:
+					valid_whois += 1
+				
+				ips = dns_resolver(ext, dns_query)
+				domains_ips += len(ips)
+		
+		if structure[key]['ext_endpoints']['IP'] is not None:
+			for ip in structure[key]['ext_endpoints']['IP']:
+				if structure[key]['ext_endpoints']['IP'][ip]['whois']['domain_name'] is not None:
+					valid_ip_whois += 1
+					
+	print("-"*32)
+	print("Malware Samples: "+str(malware_samples))
+	print("Number of domains: "+str(domains_num))
+	print("Second-level domains: "+str(sl_domains))
+	print("IPs that domains resolve to: "+str(domains_ips))
+	print("Domain WHOIS records: "+str(valid_whois))
+	print("IPs that malwares connect to: "+str(ips_num))
+	print("IP WHOIS records: "+str(valid_ip_whois))
+	print("-"*32)
+	
 if __name__ == '__main__':
     main()
