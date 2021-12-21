@@ -14,10 +14,13 @@ from nslookup import Nslookup
 from urllib.parse import urlparse
 from datetime import datetime
 import argparse
+import re
+from collections import Counter
 
 from plot import Plot
 
 encoding = 'utf-8'
+ip_reg = "^((25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])\.){3}(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])$"
 
 def md5(filename):
     hash_md5 = hashlib.md5()
@@ -67,12 +70,16 @@ def check_host(endpoint, type):
 		if res.returncode == 0:
 			return True
 		return False	
+
+def check_IPv4(ip):
+	return re.search(ip_reg, ip)
 	
 def check_domain(domain, type):
 	if type == 'url':
 		endpoint = urlparse(str(domain)).netloc
 	else:
-		endpoint = domain
+		if check_IPv4(domain):
+			endpoint = domain
 
 	try:
 		w = whois.whois(endpoint)
@@ -92,13 +99,14 @@ def dns_resolver(domain, dns_query):
 
 	return ips_record.answer
 	
-def parameters(file, timeout):
+def parameters(file, timeout, fails):
 	proc = subprocess.Popen(['vmonkey', file, '-o', 'tmp'], stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
 	vmonkey_output = {}
 
 	try:
 		proc.wait(timeout=timeout)
 	except subprocess.TimeoutExpired:
+		fails += 1
 		proc.kill()
 	
 	if proc.returncode == 0:
@@ -109,25 +117,32 @@ def parameters(file, timeout):
 	
 		res = subprocess.run(['rm', 'tmp'])
 	
-	return vmonkey_output
+		return vmonkey_output
+	
+	else:
+		fails += 1
+		return {}
 
 def logger(log):
 	now = datetime.now()
 	print("[{}] {}".format(now.strftime("%H:%M:%S"), log))
 
 def main():
+	
 	parser = argparse.ArgumentParser(description='Just another OLE document script...')
 	parser.add_argument('MLWR_DIR', metavar='MLWR_DIR', type=str, help='Where the malware(s) reside(s)')
 	parser.add_argument('-v', '--vmonkey', action='store_true', help='Enable the ViperMonkey analysis')
-	parser.add_argument('-t', '--timeout', nargs=1, type=int, default=30, help='ViperMonkey analysis timeout [default = 30s]')
+	parser.add_argument('-t', '--timeout', type=int, default=30, help='ViperMonkey analysis timeout [default = 30s]')
 	parser.add_argument('-d', '--decode', action='store_true', help='Enable olevba decode mode')
 	parser.add_argument('-D', '--deobfuscate', action='store_true', help='Enable olevba deobfuscate mode')
+	parser.add_argument('-c', '--checkhost', action='store_true', help='Enable check if a remote host is online')
 
 	args = parser.parse_args()
-	
 	directory = args.MLWR_DIR
 	failed_ovba = 0
 	failed_vmonkey = 0
+
+	vmonkey_timeout = args.timeout
 
 	structure = {}
 
@@ -142,7 +157,7 @@ def main():
 
 	logger("directory: {}".format(args.MLWR_DIR))
 	logger("olevba: show_decoded_strings: {}, deobfuscate: {}".format(args.decode, args.deobfuscate))
-	logger("vmonkey: {}, timeout: {}".format(args.vmonkey, args.timeout))
+	logger("vmonkey: {}, timeout: {}".format(args.vmonkey, vmonkey_timeout))
 
 	for filename in os.listdir(directory):
 		if 'artifacts' in filename:
@@ -193,17 +208,19 @@ def main():
 					sus.append(keyword)
 				if 'IOC' in kw_type:
 					iocs.append(keyword)
-					if 'http' in keyword:
+					if 'http' in keyword or '://' in keyword:
 						isProbablyDownloader = True
 						structure[filename]['ext_endpoints']['domains'][keyword] = {}
 						structure[filename]['ext_endpoints']['domains'][keyword]['whois'] = check_domain(keyword, 'url')
-						structure[filename]['ext_endpoints']['domains'][keyword]['isOnline'] = check_host(keyword, 'url')
+						if args.checkhost:
+							structure[filename]['ext_endpoints']['domains'][keyword]['isOnline'] = check_host(keyword, 'url')
 
-				if 'IP' in description:
+				if check_IPv4(keyword):
 					isProbablyDownloader = True
 					structure[filename]['ext_endpoints']['IP'][keyword] = {}
 					structure[filename]['ext_endpoints']['IP'][keyword]['whois'] = check_domain(keyword, 'IP')
-					structure[filename]['ext_endpoints']['IP'][keyword]['isHTTP200'] = check_host(keyword, 'IP')
+					if args.checkhost:
+						structure[filename]['ext_endpoints']['IP'][keyword]['isHTTP200'] = check_host(keyword, 'IP')
 
 		logger("Getting the hypothetical category, IOCs and number of macros...")
 
@@ -213,9 +230,24 @@ def main():
 		structure[filename]['macros_num'] = vbaparser.nb_macros
 		
 		if args.vmonkey is True:
-			structure[filename]['vmonkey_results'] = parameters(file, args.timeout)
-			print(structure[filename]['vmonkey_results'])
-		
+			vmonkey_out = parameters(file, vmonkey_timeout, failed_vmonkey)
+
+			if len(vmonkey_out) != 0:
+				for ioc in vmonkey_out['potential_iocs']:
+					if ('http' in ioc or '://' in ioc) and ioc not in structure[filename]['ext_endpoints']['domains']:
+						structure[filename]['ext_endpoints']['domains'][ioc] = {}
+						structure[filename]['ext_endpoints']['domains'][ioc]['whois'] = check_domain(ioc, 'url')
+						if args.checkhost:
+							structure[filename]['ext_endpoints']['domains'][ioc]['isOnline'] = check_host(ioc, 'url')
+					
+					if check_IPv4(ioc) and ioc not in structure[filename]['ext_endpoints']['IP']:
+						structure[filename]['ext_endpoints']['IP'][ioc] = {}
+						structure[filename]['ext_endpoints']['IP'][ioc]['whois'] = check_domain(ioc, 'url')
+						if args.checkhost:
+							structure[filename]['ext_endpoints']['IP'][ioc]['isOnline'] = check_host(ioc, 'url')
+
+			structure[filename]['vmonkey_results'] = vmonkey_out
+
 		with open(directory+'_results.txt', 'a') as f:
 			json.dump(structure[filename], f)
 			f.write(os.linesep)
@@ -246,7 +278,25 @@ def main():
 	valid_ip_whois = 0
 	ips_num = 0
 
+	different_mime = []
+	dropper = 0
+	downloader = 0
+	obf = []
+
 	for key in structure.keys():
+		different_mime.append(structure[key]['mime'])
+
+		for methods in structure[key]['obfuscation_methods']:
+			if len(methods) == 0:
+				continue
+			else:
+				obf.append(methods)
+
+		if structure[key]['category'] == 'Dropper':
+			dropper += 1
+		else:
+			downloader += 1
+
 		domains_num += len(structure[key]['ext_endpoints']['domains'].keys())
 		ips_num += len(structure[key]['ext_endpoints']['IP'].keys())
 		
@@ -266,7 +316,7 @@ def main():
 			for ip in structure[key]['ext_endpoints']['IP']:
 				if structure[key]['ext_endpoints']['IP'][ip]['whois']['domain_name'] is not None:
 					valid_ip_whois += 1
-					
+
 	print("-"*32)
 	print("Malware Samples: "+str(malware_samples))
 	print("Number of domains: "+str(domains_num))
@@ -275,6 +325,16 @@ def main():
 	print("Domain WHOIS records: "+str(valid_whois))
 	print("IPs that malwares connect to: "+str(ips_num))
 	print("IP WHOIS records: "+str(valid_ip_whois))
+	print("-"*32)
+	print("Different MIME: "+str(set(different_mime)))
+	print("-"*32)
+	print("Probably Droppers: {}; Probably Downloaders: {}".format(dropper, downloader))
+	print("-"*32)
+	print(str(Counter(obf)))
+	print("-"*32)	
+	print("DEBUG "+"-"*32)
+	print("olevba failures: "+str(failed_ovba))
+	print("vmonkey failures: "+str(failed_vmonkey))
 	print("-"*32)
 	
 if __name__ == '__main__':
